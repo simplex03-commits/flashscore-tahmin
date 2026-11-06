@@ -43,7 +43,9 @@ def parse_fixtures_from_text(page_text, requested_date):
         raise ValueError("Tarih biçimi geçersiz.")
     target_key = (target.day, target.month)
     fixtures, seen = [], set()
-    date_time_pattern = re.compile(r"^(\d{1,2})\.(\d{1,2})\.?\s+(\d{1,2}:\d{2})$")
+    date_time_pattern = re.compile(
+        r"^(\d{1,2})\.(\d{1,2})\.(?:\d{4}\\.?)?\\s+(\d{1,2}:\d{2})$"
+    )
     i = 0
     while i < len(lines):
         match = date_time_pattern.match(lines[i])
