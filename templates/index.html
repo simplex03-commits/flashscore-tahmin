@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#17243a"><title>Flashscore | Bahis Analizi</title>
+<style>
+:root{--bg:#f3f6fb;--panel:#fff;--ink:#17243a;--muted:#64748b;--blue:#1687e8;--line:#d8e1ed;--soft:#f8fafd}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+.wrap{max-width:1250px;margin:auto;padding:22px}.head{margin-bottom:16px}.head h1{font-size:28px;margin:0;font-weight:800;letter-spacing:-.5px}.head p{margin:4px 0;color:var(--muted)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px;box-shadow:0 3px 12px #17243a08}
+.filters{display:grid;grid-template-columns:1fr 1fr auto;gap:14px;align-items:end;margin-bottom:14px}.field label{display:block;font-size:13px;color:var(--muted);font-weight:650;margin-bottom:5px}
+input,select,button{font:inherit;border-radius:9px;min-height:44px}input,select{width:100%;padding:9px 11px;border:1px solid var(--line);background:#f7f9fc;color:var(--ink)}button{border:0;padding:10px 16px;font-weight:700;cursor:pointer}.primary{background:var(--blue);color:white}.primary:disabled{opacity:.55;cursor:wait}
+.layout{display:grid;grid-template-columns:minmax(280px, .9fr) minmax(0,1.35fr);gap:14px}.card h2{font-size:17px;margin:0 0 12px}.count{float:right;color:var(--muted);font-size:13px;font-weight:500}.search{margin-bottom:10px}.matches{display:flex;flex-direction:column;gap:7px;max-height:570px;overflow:auto}.match{width:100%;text-align:left;background:var(--soft);border:1px solid var(--line);color:var(--ink);padding:11px 12px;min-height:unset}.match.active{border-color:var(--blue);background:#eaf4ff}.time{color:var(--blue);font-weight:800;margin-right:8px}.analysis{white-space:pre-wrap;min-height:320px;color:#344a8a;font-size:16px;line-height:1.8}.status{margin-top:12px;padding:10px 12px;background:#e8eef6;border-radius:9px;color:var(--muted);font-size:13px}.progress{height:5px;background:#e2e8f0;border-radius:9px;overflow:hidden;margin-top:12px;display:none}.progress span{display:block;height:100%;width:35%;background:var(--blue);animation:move 1.1s infinite ease-in-out alternate}@keyframes move{from{transform:translateX(-50%)}to{transform:translateX(220%)}}
+@media(max-width:760px){.wrap{padding:14px}.head h1{font-size:24px}.filters{grid-template-columns:1fr 1fr}.filters button{grid-column:1/-1;width:100%}.layout{grid-template-columns:1fr}.matches{max-height:330px}.analysis{min-height:230px;font-size:15px}}
+</style></head>
+<body><main class="wrap">
+<header class="head"><h1>FLASHSCORE</h1><p>Fikstürleri görüntüle · Bahis analizlerini tek ekranda incele</p></header>
+<section class="card filters">
+ <div class="field"><label for="date">Tarih</label><input id="date" type="date"></div>
+ <div class="field"><label for="league">Lig seçimi</label><select id="league">{% for league in leagues %}<option>{{ league }}</option>{% endfor %}</select></div>
+ <button id="fetch" class="primary">↻ Maçları Getir</button>
+</section>
+<section class="layout">
+ <div class="card"><h2>Maç programı <span class="count" id="count">0 maç</span></h2>
+  <input class="search" id="search" placeholder="Maç ara..." autocomplete="off">
+  <div class="matches" id="matches"><div style="color:#64748b">Tarih ve ligi seçip maçları getirin.</div></div>
+ </div>
+ <div class="card"><h2>Bahis Analizi <span class="count">MAÇ YORUMU</span></h2>
+  <div class="analysis" id="analysis">Maçları getirin ve listeden bir karşılaşma seçin. Analiz burada görüntülenecek.</div>
+ </div>
+</section>
+<div class="progress" id="progress"><span></span></div><div class="status" id="status">Hazır · Önce tarih ve ligi seçin.</div>
+</main>
+<script>
+const $=id=>document.getElementById(id);let allMatches=[],selected=-1,busy=false;
+const today=new Date();$('date').value=[today.getFullYear(),String(today.getMonth()+1).padStart(2,'0'),String(today.getDate()).padStart(2,'0')].join('-');
+function loading(on,msg){busy=on;$('progress').style.display=on?'block':'none';$('fetch').disabled=on;if(msg)$('status').textContent=msg;}
+function renderMatches(){const q=$('search').value.trim().toLocaleLowerCase('tr-TR');const box=$('matches');box.innerHTML='';let shown=0;
+ allMatches.forEach((m,i)=>{const label=`${m.time} ${m.home} ${m.away}`;if(q&&!label.toLocaleLowerCase('tr-TR').includes(q))return;shown++;const b=document.createElement('button');b.className='match'+(selected===i?' active':'');b.innerHTML=`<span class="time"></span>`;b.querySelector('.time').textContent=m.time;b.append(document.createTextNode(` ${m.home} - ${m.away}`));b.onclick=()=>chooseMatch(i);box.append(b);});
+ $('count').textContent=q?`${shown} / ${allMatches.length} maç`:`${allMatches.length} maç`;if(!shown)box.textContent='Eşleşen maç bulunamadı.';
+}
+async function fetchFixtures(){if(busy)return;loading(true,'Flashscore fikstürleri yükleniyor...');$('analysis').textContent='Seçilen tarihin maçları getiriliyor...';$('matches').textContent='Maçlar yükleniyor...';allMatches=[];selected=-1;$('count').textContent='0 maç';
+ try{const r=await fetch('/api/fixtures',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({date:$('date').value,league:$('league').value})});const d=await r.json();if(!r.ok)throw Error(d.error||'Fikstür alınamadı.');allMatches=d.fixtures||[];renderMatches();$('analysis').textContent=allMatches.length?'Listeden bir maç seçin. Sağ tarafta Bahis Analizi gösterilecek.':'Seçilen tarih için maç bulunamadı.';$('status').textContent=`${allMatches.length} maç bulundu.`;
+ }catch(e){$('matches').textContent='Maçlar alınamadı.';$('analysis').textContent=e.message;$('status').textContent='Hata oluştu.';}finally{loading(false);}}
+async function chooseMatch(i){if(busy)return;selected=i;renderMatches();const m=allMatches[i];if(!m.url){$('analysis').textContent='Bu maçın Flashscore bağlantısı bulunamadı.';$('status').textContent='Maç bağlantısı bulunamadı.';return;}
+ loading(true,`Analiz yükleniyor: ${m.home} - ${m.away}`);$('analysis').textContent='Bahis Analizi yükleniyor...';try{const r=await fetch('/api/analysis',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:m.url})});const d=await r.json();if(!r.ok)throw Error(d.error||'Analiz alınamadı.');m.analysis=d.analysis;$('analysis').textContent=d.analysis;$('status').textContent='Analiz hazır.';}catch(e){$('analysis').textContent=e.message;$('status').textContent='Analiz alınamadı.';}finally{loading(false);}}
+$('fetch').addEventListener('click',fetchFixtures);$('search').addEventListener('input',renderMatches);
+</script></body></html>
