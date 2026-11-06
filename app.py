@@ -6,6 +6,13 @@ from datetime import datetime
 from urllib.parse import urljoin
 
 from flask import Flask, jsonify, render_template, request
+
+# Chromium'u Render'in gecici cache klasoru yerine uygulama dizininde tut.
+# Ayni yol hem build sirasinda hem de uygulama calisirken kullanilir.
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".playwright-browsers"
+)
+
 from playwright.sync_api import sync_playwright
 
 app = Flask(__name__)
