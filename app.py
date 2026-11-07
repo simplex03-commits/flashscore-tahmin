@@ -2,6 +2,9 @@
 """Flashscore fikstur ve bahis analizi - web surumu."""
 import os
 import re
+import threading
+import sqlite3
+import json
 from datetime import datetime
 from urllib.parse import urljoin
 
@@ -37,11 +40,78 @@ HTTP_HEADERS = {
     "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.7,en;q=0.6",
     "Cache-Control": "no-cache",
 }
+# Render'in 512 MB bellek sınırında eşzamanlı HTML ayrıştırmalarını önle.
+# İstekler sıraya girer; aynı içerik SQLite önbelleğindeyse sırayı beklemeden döner.
+_SCRAPE_SEMAPHORE = threading.BoundedSemaphore(1)
+
+# SQLite önbelleği: kayıtlar süre dolduğu için silinmez.
+# Render'da kalıcı disk bağlanırsa CACHE_DB_PATH=/var/data/flashscore_cache.sqlite3
+# ayarlanarak önbellek deploy/yeniden başlatmalardan sonra da korunabilir.
+CACHE_DB_PATH = os.environ.get(
+    "CACHE_DB_PATH", "/tmp/flashscore_cache.sqlite3"
+)
+
 _HTTP_CLIENT = httpx.Client(
     headers=HTTP_HEADERS,
     timeout=HTTP_TIMEOUT,
     follow_redirects=True,
+    limits=httpx.Limits(max_connections=2, max_keepalive_connections=1),
 )
+
+
+
+def _cache_connection():
+    folder = os.path.dirname(CACHE_DB_PATH)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    conn = sqlite3.connect(CACHE_DB_PATH, timeout=30)
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cache (
+            cache_key TEXT PRIMARY KEY,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    return conn
+
+
+def _serialize_cache_key(key):
+    return json.dumps(key, ensure_ascii=False, separators=(",", ":"))
+
+
+def cache_get(key):
+    """Daha önce çekilmiş veriyi süresiz SQLite önbelleğinden döndürür."""
+    conn = _cache_connection()
+    try:
+        row = conn.execute(
+            "SELECT payload FROM cache WHERE cache_key = ?",
+            (_serialize_cache_key(key),)
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+    finally:
+        conn.close()
+
+
+def cache_set(key, value):
+    """Başarılı veriyi süresiz saklar; aynı anahtar tekrar indirilmez."""
+    payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    conn = _cache_connection()
+    try:
+        conn.execute(
+            "INSERT INTO cache(cache_key, payload) VALUES(?, ?) "
+            "ON CONFLICT(cache_key) DO UPDATE SET payload=excluded.payload, "
+            "created_at=CURRENT_TIMESTAMP",
+            (_serialize_cache_key(key), payload)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def acquire_scrape_slot():
+    # Diğer cihazın isteği bitene kadar bekle; sunucuya paralel yük bindirme.
+    return _SCRAPE_SEMAPHORE.acquire(timeout=60)
 
 
 def http_get_html(url):
@@ -248,28 +318,48 @@ def api_fixtures():
         date_obj = datetime.strptime(date_text, "%Y-%m-%d")
         if league not in LEAGUES:
             return jsonify(error="Lütfen geçerli bir lig seçin."), 400
-        league_path = LEAGUES[league].rstrip("/")
-        if not league_path.endswith("/fikstur"):
-            league_path += "/fikstur"
-        league_path += "/"
-        url = BASE_URL + league_path + "?d=" + date_obj.strftime("%Y-%m-%d")
 
-        response, document, page_text = http_get_html(url)
-        fixtures = parse_fixtures_from_text(page_text, date_text)
-        if fixtures:
-            attach_match_urls_from_html(document, fixtures)
+        cache_key = ("fixtures", date_text, league)
+        cached = cache_get(cache_key)
+        if cached is not None:
+            return jsonify(fixtures=cached, count=len(cached), source="cache")
 
-        missing_urls = sum(1 for item in fixtures if not item.get("url"))
-        app.logger.info(
-            "Fikstur kaynagi=httpx status=%s count=%s missing_urls=%s",
-            response.status_code, len(fixtures), missing_urls
-        )
-        if missing_urls:
-            app.logger.warning(
-                "HTTPX fiksturlerinde %s mac icin mac baglantisi bulunamadi.",
-                missing_urls
+        if not acquire_scrape_slot():
+            response = jsonify(error="Sunucu şu anda başka bir veri isteğini işliyor. Lütfen tekrar deneyin.")
+            response.status_code = 503
+            response.headers["Retry-After"] = "5"
+            return response
+        try:
+            # Sıra beklerken aynı veri başka istek tarafından önbelleğe alınmış olabilir.
+            cached = cache_get(cache_key)
+            if cached is not None:
+                return jsonify(fixtures=cached, count=len(cached), source="cache")
+
+            league_path = LEAGUES[league].rstrip("/")
+            if not league_path.endswith("/fikstur"):
+                league_path += "/fikstur"
+            league_path += "/"
+            url = BASE_URL + league_path + "?d=" + date_obj.strftime("%Y-%m-%d")
+
+            response, document, page_text = http_get_html(url)
+            fixtures = parse_fixtures_from_text(page_text, date_text)
+            if fixtures:
+                attach_match_urls_from_html(document, fixtures)
+
+            missing_urls = sum(1 for item in fixtures if not item.get("url"))
+            app.logger.info(
+                "Fikstur kaynagi=httpx status=%s count=%s missing_urls=%s",
+                response.status_code, len(fixtures), missing_urls
             )
-        return jsonify(fixtures=fixtures, count=len(fixtures), source="httpx")
+            if missing_urls:
+                app.logger.warning(
+                    "HTTPX fiksturlerinde %s mac icin mac baglantisi bulunamadi.",
+                    missing_urls
+                )
+            cache_set(cache_key, fixtures)
+            return jsonify(fixtures=fixtures, count=len(fixtures), source="httpx")
+        finally:
+            _SCRAPE_SEMAPHORE.release()
     except Exception as exc:
         app.logger.exception("HTTPX ile fikstur alinamadi")
         return jsonify(error=f"Maçlar HTTPX ile alınamadı: {str(exc)[:300]}"), 502
@@ -279,9 +369,25 @@ def api_fixtures():
 def api_analysis():
     data = request.get_json(silent=True) or {}
     match_url = data.get("url", "")
-    if not match_url.startswith(BASE_URL + "/"):
+    if not isinstance(match_url, str) or not match_url.startswith(BASE_URL + "/"):
         return jsonify(error="Geçersiz maç bağlantısı."), 400
+
+    cache_key = ("analysis", match_url)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return jsonify(analysis=cached, source="cache")
+
+    if not acquire_scrape_slot():
+        response = jsonify(error="Sunucu şu anda başka bir veri isteğini işliyor. Lütfen tekrar deneyin.")
+        response.status_code = 503
+        response.headers["Retry-After"] = "5"
+        return response
     try:
+        # Sıra beklerken aynı analiz başka istek tarafından alınmış olabilir.
+        cached = cache_get(cache_key)
+        if cached is not None:
+            return jsonify(analysis=cached, source="cache")
+
         response, document, _ = http_get_html(match_url)
         analysis = extract_analysis_from_html(document)
         if not analysis:
@@ -292,6 +398,7 @@ def api_analysis():
                 error="Bu maçın bahis analizi HTTPX yanıtında bulunamadı. Flashscore sayfa içeriğini değiştirmiş olabilir."
             ), 502
 
+        cache_set(cache_key, analysis)
         app.logger.info(
             "Analiz kaynagi=httpx status=%s url=%s",
             response.status_code, match_url
@@ -300,6 +407,8 @@ def api_analysis():
     except Exception as exc:
         app.logger.exception("HTTPX ile analiz alinamadi")
         return jsonify(error=f"Bahis analizi HTTPX ile alınamadı: {str(exc)[:300]}"), 502
+    finally:
+        _SCRAPE_SEMAPHORE.release()
 
 
 @app.get("/health")
