@@ -1,8 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Flashscore fikstur ve bahis analizi - Render icin duzeltilmis web surumu."""
+"""Flashscore fikstur ve bahis analizi - web surumu."""
 import os
 import re
+import threading
+import atexit
 from datetime import datetime
+from urllib.parse import urljoin
+
+import httpx
+from lxml import html as lxml_html
 
 from flask import Flask, jsonify, render_template, request
 
@@ -28,6 +34,96 @@ LEAGUES = {
     "Konferans Ligi": "/futbol/europe/konferans-ligi/fikstur/",
 }
 
+
+
+# Önce hafif HTTP istemcisi denenir; Flashscore içeriği sunucu tarafında
+# gelmiyorsa mevcut Playwright akışına geri dönülür.
+HTTP_TIMEOUT = httpx.Timeout(connect=8.0, read=18.0, write=10.0, pool=8.0)
+HTTP_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/125.0.0.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.7,en;q=0.6",
+    "Cache-Control": "no-cache",
+}
+_HTTP_CLIENT = httpx.Client(
+    headers=HTTP_HEADERS,
+    timeout=HTTP_TIMEOUT,
+    follow_redirects=True,
+)
+
+
+def http_get_html(url):
+    """Flashscore HTML'sini tarayıcı başlatmadan almaya çalışır."""
+    response = _HTTP_CLIENT.get(url)
+    response.raise_for_status()
+    content_type = response.headers.get("content-type", "").lower()
+    if "html" not in content_type and "text" not in content_type:
+        raise ValueError(f"Beklenmeyen içerik türü: {content_type or 'bilinmiyor'}")
+    page = lxml_html.fromstring(response.text)
+    title = " ".join(page.xpath("//title//text()"))
+    body_text = "\n".join(t.strip() for t in page.xpath("//body//text()") if t.strip())
+    # Bot kontrolü / erişim engeli sayfalarını başarılı veri gibi kullanma.
+    blocked_markers = ("access denied", "just a moment", "captcha", "verify you are human")
+    if any(x in (title + " " + body_text[:1500]).lower() for x in blocked_markers):
+        raise RuntimeError("Flashscore HTTP isteğini doğrulama/erişim sayfasına yönlendirdi.")
+    return response, page, body_text
+
+
+def attach_match_urls_from_html(document, fixtures):
+    """HTML içindeki maç bağlantılarını takım adlarıyla eşleştirir."""
+    links = []
+    seen = set()
+    for anchor in document.xpath('//a[contains(@href, "/mac/")]'):
+        href = urljoin(BASE_URL, anchor.get("href", ""))
+        node = anchor
+        for _ in range(7):
+            if node is None:
+                break
+            text = normalize_text(" ".join(node.xpath(".//text()")))
+            if 8 <= len(text) <= 260:
+                key = (href, text)
+                if key not in seen:
+                    links.append({"url": href, "text": text, "length": len(text)})
+                    seen.add(key)
+            node = node.getparent()
+
+    for fixture in fixtures:
+        home = normalize_text(fixture["home"]).casefold()
+        away = normalize_text(fixture["away"]).casefold()
+        candidates = [x for x in links
+                      if home in normalize_text(x["text"]).casefold()
+                      and away in normalize_text(x["text"]).casefold()]
+        candidates.sort(key=lambda x: x["length"])
+        fixture["url"] = candidates[0]["url"] if candidates else ""
+
+
+def extract_analysis_from_html(document):
+    """Bahis Analizi metnini statik HTML'den çıkarmayı dener."""
+    text = "\n".join(t.strip() for t in document.xpath("//body//text()") if t.strip())
+    return extract_analysis_from_text(text)
+
+
+def extract_analysis_from_text(page_text):
+    """Bahis Analizi başlığından metni alır; sayfa metni yetersizse boş döner."""
+    if not page_text:
+        return ""
+    lines = [x.strip() for x in page_text.replace("\r", "").splitlines() if x.strip()]
+    for i, line in enumerate(lines):
+        if line.casefold() == "bahis analizi":
+            section = " ".join(lines[i + 1:i + 35]).strip()
+            lowered = section.casefold()
+            for marker in ("bu içerik yapay zeka kullanılarak oluşturuldu",
+                           "ai kullanılarak çevrilmiştir"):
+                pos = lowered.find(marker.casefold())
+                if pos >= 0:
+                    section = section[:pos + len(marker)]
+                    break
+            section = normalize_text(section)
+            if 15 < len(section) < 3000:
+                return section
+    return ""
 
 def normalize_text(value):
     return re.sub(r"\s+", " ", value or "").strip()
@@ -244,58 +340,46 @@ def extract_analysis(page):
     return result or "Bu maç sayfasında 'Bahis Analizi' bölümü bulunamadı."
 
 
-def open_browser_context():
-    """Her HTTP isteğinde aynı thread içinde yeni Playwright oturumu aç.
+# Playwright senkron API'si thread-bound'dur. Flask istekleri farklı
+# thread'lerde çalışabileceği için her thread kendi Playwright/Chromium
+# örneğini kullanır. Aynı thread sonraki isteklerde tarayıcıyı yeniden kullanır.
+_BROWSER_STATE = threading.local()
 
-    Playwright sync nesneleri thread-bound olduğu için Gunicorn thread'leri
-    arasında tarayıcı paylaşılmaz. İstek bitince context, browser ve Playwright
-    kesin olarak kapatılır; eski thread-local oturumların birikmesi önlenir.
-    """
-    playwright = sync_playwright().start()
-    browser = None
-    context = None
-    try:
+
+def browser_context(_p=None):
+    playwright = getattr(_BROWSER_STATE, "playwright", None)
+    browser = getattr(_BROWSER_STATE, "browser", None)
+
+    if playwright is None or browser is None or not browser.is_connected():
+        # Bozuk/eski oturumu bu thread içinde temizle.
+        try:
+            if browser is not None and browser.is_connected():
+                browser.close()
+        except Exception:
+            pass
+        try:
+            if playwright is not None:
+                playwright.stop()
+        except Exception:
+            pass
+
+        playwright = sync_playwright().start()
         browser = playwright.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
-        context = browser.new_context(locale="tr-TR")
-        context.set_default_timeout(15000)
-        context.set_default_navigation_timeout(45000)
-        context.route(
-            "**/*",
-            lambda route: route.abort()
-            if route.request.resource_type in ("image", "media", "font")
-            else route.continue_()
-        )
-        return playwright, browser, context
-    except Exception:
-        if context:
-            try:
-                context.close()
-            except Exception:
-                pass
-        if browser:
-            try:
-                browser.close()
-            except Exception:
-                pass
-        playwright.stop()
-        raise
+        _BROWSER_STATE.playwright = playwright
+        _BROWSER_STATE.browser = browser
 
-
-def close_browser_context(playwright, browser, context):
-    for resource in (context, browser):
-        if resource is not None:
-            try:
-                resource.close()
-            except Exception:
-                pass
-    if playwright is not None:
-        try:
-            playwright.stop()
-        except Exception:
-            pass
+    context = browser.new_context(locale="tr-TR")
+    # Görsel/video/font indirmeleri maç metni ve analiz için gerekli değil.
+    context.route(
+        "**/*",
+        lambda route: route.abort()
+        if route.request.resource_type in ("image", "media", "font")
+        else route.continue_()
+    )
+    return browser, context
 
 
 @app.get("/")
@@ -316,7 +400,23 @@ def api_fixtures():
             league_path += "/fikstur"
         league_path += "/"
         url = BASE_URL + league_path + "?d=" + date_obj.strftime("%Y-%m-%d")
-        playwright, browser, context = open_browser_context()
+
+        # 1) Hızlı yol: HTTPX + lxml (Chromium başlatılmaz).
+        try:
+            response, document, page_text = http_get_html(url)
+            fixtures = parse_fixtures_from_text(page_text, date_text)
+            if fixtures:
+                attach_match_urls_from_html(document, fixtures)
+            # Eksik liste veya maç bağlantısı varsa sağlam mevcut yönteme dön.
+            if fixtures and all(item.get("url") for item in fixtures):
+                app.logger.info("Fikstur kaynagi=httpx status=%s count=%s", response.status_code, len(fixtures))
+                return jsonify(fixtures=fixtures, count=len(fixtures), source="httpx")
+            app.logger.info("HTTPX fikstur verisi yetersiz; Playwright yedegine geciliyor. count=%s", len(fixtures))
+        except Exception as http_exc:
+            app.logger.warning("HTTPX fikstur denemesi basarisiz; Playwright yedegine geciliyor: %s", http_exc)
+
+        # 2) Yedek yol: çalışan Playwright akışı.
+        browser, context = browser_context()
         try:
             page = context.new_page()
             response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -325,16 +425,15 @@ def api_fixtures():
             fixtures = parse_fixtures_from_text(page_text, date_text)
             attach_match_urls(page, fixtures)
             app.logger.info(
-                "Masaustu akisi: status=%s url=%s fixtures=%s body_chars=%s",
-                response.status if response else "no-response",
-                page.url, len(fixtures), len(page_text)
+                "Fikstur kaynagi=playwright status=%s url=%s fixtures=%s body_chars=%s",
+                response.status if response else "no-response", page.url, len(fixtures), len(page_text)
             )
             if not fixtures:
                 app.logger.warning("Flashscore sayfa metni (ilk 1800 karakter): %s",
                                     normalize_text(page_text)[:1800])
         finally:
-            close_browser_context(playwright, browser, context)
-        return jsonify(fixtures=fixtures, count=len(fixtures))
+            context.close()
+        return jsonify(fixtures=fixtures, count=len(fixtures), source="playwright")
     except Exception as exc:
         app.logger.exception("Fikstur alinamadi")
         return jsonify(error=f"Maçlar alınamadı: {str(exc)[:300]}"), 500
@@ -344,53 +443,39 @@ def api_fixtures():
 def api_analysis():
     data = request.get_json(silent=True) or {}
     match_url = data.get("url", "")
-    if not isinstance(match_url, str) or not match_url.startswith(BASE_URL + "/"):
+    if not match_url.startswith(BASE_URL + "/"):
         return jsonify(error="Geçersiz maç bağlantısı."), 400
     try:
-        playwright, browser, context = open_browser_context()
+        # 1) Hızlı yol: analiz HTML içinde mevcutsa doğrudan al.
+        try:
+            response, document, _ = http_get_html(match_url)
+            analysis = extract_analysis_from_html(document)
+            if analysis:
+                app.logger.info("Analiz kaynagi=httpx status=%s url=%s", response.status_code, match_url)
+                return jsonify(analysis=analysis, source="httpx")
+            app.logger.info("Analiz HTTPX yanitinda bulunamadi; Playwright yedegine geciliyor.")
+        except Exception as http_exc:
+            app.logger.warning("HTTPX analiz denemesi basarisiz; Playwright yedegine geciliyor: %s", http_exc)
+
+        # 2) Flashscore içeriği JavaScript ile oluşturuyorsa mevcut tarayıcı yolu.
+        browser, context = browser_context()
         try:
             page = context.new_page()
-            response = page.goto(match_url, wait_until="domcontentloaded", timeout=45000)
-            if response is not None and response.status >= 400:
-                raise RuntimeError(f"Flashscore maç sayfası HTTP {response.status} yanıtı verdi.")
+            page.goto(match_url, wait_until="domcontentloaded", timeout=60000)
             try:
                 page.wait_for_function(
                     "() => (document.body?.innerText || '').toLocaleLowerCase('tr-TR').includes('bahis analizi')",
                     timeout=5000
                 )
             except Exception:
-                # Bazı maçlarda analiz bölümü hiç olmayabilir; mevcut çıkarıcı
-                # yine de sayfayı kontrol edip açıklayıcı sonuç döndürür.
                 pass
             analysis = extract_analysis(page)
         finally:
-            close_browser_context(playwright, browser, context)
-        return jsonify(analysis=analysis)
+            context.close()
+        return jsonify(analysis=analysis, source="playwright")
     except Exception as exc:
         app.logger.exception("Analiz alinamadi")
         return jsonify(error=f"Analiz alınamadı: {str(exc)[:300]}"), 500
-
-
-@app.errorhandler(404)
-def handle_not_found(error):
-    if request.path.startswith("/api/"):
-        return jsonify(error="API adresi bulunamadı: " + request.path), 404
-    return error
-
-
-@app.errorhandler(405)
-def handle_method_not_allowed(error):
-    if request.path.startswith("/api/"):
-        return jsonify(error="Bu API adresi için HTTP yöntemi desteklenmiyor."), 405
-    return error
-
-
-@app.errorhandler(500)
-def handle_internal_error(error):
-    if request.path.startswith("/api/"):
-        app.logger.exception("API içinde beklenmeyen sunucu hatası")
-        return jsonify(error="Sunucuda beklenmeyen bir hata oluştu."), 500
-    return error
 
 
 @app.get("/health")
