@@ -150,30 +150,51 @@ def parse_fixtures_from_text(page_text, requested_date):
 
 
 def attach_match_urls(page, fixtures):
+    """Her fikstürü kendi maç satırındaki Flashscore bağlantısıyla eşleştirir.
+
+    Önceki sürüm, bağlantının üst kapsayıcılarının tamamını tarıyordu.
+    Bu kapsayıcılar birden fazla maçı içerdiğinde ilk maçın bağlantısı
+    bütün fikstürlere atanabiliyordu. Yeni sürüm en küçük eşleşen DOM
+    kapsayıcısını seçer ve aşırı geniş kapsayıcıları dikkate almaz.
+    """
     links = page.evaluate(r"""() => {
-      const result = [], seen = new Set();
-      for (const a of document.querySelectorAll('a[href]')) {
-        const href = a.getAttribute('href') || '';
-        if (!href.includes('/mac/')) continue;
+      const result = [];
+      const seen = new Set();
+      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+      for (const a of document.querySelectorAll('a[href*="/mac/"]')) {
+        const href = a.href;
         let node = a;
-        for (let depth = 0; depth < 5 && node; depth++, node = node.parentElement) {
-          const text = (node.innerText || '').replace(/\s+/g, ' ').trim();
-          if (text.length > 10 && text.length < 1000) {
-            const key = a.href + '|' + text;
-            if (!seen.has(key)) { result.push({url: a.href, text}); seen.add(key); }
+        // En yakın ve kısa maç satırlarını topla; tüm fikstür listesini
+        // kapsayan büyük üst elemanları özellikle dışarıda bırak.
+        for (let depth = 0; depth < 7 && node; depth++, node = node.parentElement) {
+          const text = norm(node.innerText);
+          if (text.length < 8 || text.length > 260) continue;
+          const key = href + '|' + text;
+          if (!seen.has(key)) {
+            result.push({url: href, text, length: text.length});
+            seen.add(key);
           }
         }
       }
       return result;
     }""")
+
     for fixture in fixtures:
         home = normalize_text(fixture["home"]).casefold()
         away = normalize_text(fixture["away"]).casefold()
+
+        # Eşleşen en küçük metin, genellikle ilgili maçın kendi satırıdır.
+        candidates = []
         for entry in links:
             text = normalize_text(entry.get("text", "")).casefold()
             if home in text and away in text:
-                fixture["url"] = entry.get("url", "")
-                break
+                candidates.append(entry)
+
+        if candidates:
+            candidates.sort(key=lambda item: item.get("length", len(item.get("text", ""))))
+            fixture["url"] = candidates[0].get("url", "")
+        else:
+            fixture["url"] = ""
 
 
 def extract_analysis(page):
