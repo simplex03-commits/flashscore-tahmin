@@ -35,47 +35,134 @@ def normalize_text(value):
 
 
 def parse_fixtures_from_text(page_text, requested_date):
+    """Flashscore sayfa metninden maçları bulur; tarih/saat satırlarının
+    tek satırda veya ayrı satırlarda gelmesini destekler."""
     lines = [normalize_text(line) for line in (page_text or "").splitlines()]
     lines = [line for line in lines if line]
+
     try:
         target = datetime.strptime(requested_date, "%Y-%m-%d")
     except ValueError:
         raise ValueError("Tarih biçimi geçersiz.")
+
     target_key = (target.day, target.month)
     fixtures, seen = [], set()
-    date_time_pattern = re.compile(
-        r"^(\d{1,2})\.(\d{1,2})\.(?:\d{4}\.?)?\s+(\d{1,2}:\d{2})$"
+
+    date_pattern = re.compile(
+        r"^(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\.?$"
     )
+    combined_pattern = re.compile(
+        r"^(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\.?\s+(\d{1,2}:\d{2})$"
+    )
+    time_pattern = re.compile(r"^\d{1,2}:\d{2}$")
+    ignored = {
+        "PREVIEW", "PREVİEW", "CANLI", "ERTELENDİ", "İPTAL",
+        "MAÇ BİTTİ", "DEVRE ARASI", "CANLI PUAN DURUMU",
+        "İSPANYA:", "ALMANYA:", "İNGİLTERE:", "FRANSA:",
+        "İTALYA:", "TÜRKİYE:"
+    }
+
     i = 0
     while i < len(lines):
-        match = date_time_pattern.match(lines[i])
-        if not match:
+        day = month = None
+        kickoff = None
+        consumed = 1
+
+        combined = combined_pattern.match(lines[i])
+        if combined:
+            day, month, kickoff = int(combined.group(1)), int(combined.group(2)), combined.group(4)
+        else:
+            date_match = date_pattern.match(lines[i])
+            if date_match and i + 1 < len(lines) and time_pattern.match(lines[i + 1]):
+                day, month = int(date_match.group(1)), int(date_match.group(2))
+                kickoff = lines[i + 1]
+                consumed = 2
+
+        if day is None or (day, month) != target_key:
             i += 1
             continue
-        day, month, kickoff = int(match.group(1)), int(match.group(2)), match.group(3)
-        if (day, month) != target_key:
-            i += 1
-            continue
-        teams, j = [], i + 1
+
+        teams = []
+        j = i + consumed
         while j < len(lines) and len(teams) < 2:
             candidate = lines[j]
-            if date_time_pattern.match(candidate):
+            if combined_pattern.match(candidate) or date_pattern.match(candidate):
                 break
-            upper = candidate.upper()
-            if upper in {"PREVIEW", "PREVİEW", "CANLI", "ERTELENDİ", "İPTAL", "MAÇ BİTTİ", "DEVRE ARASI",
-                         "İSPANYA:", "ALMANYA:", "İNGİLTERE:", "FRANSA:", "İTALYA:", "TÜRKİYE:", "CANLI PUAN DURUMU"}:
+            if time_pattern.match(candidate) or candidate.upper() in ignored:
                 j += 1
                 continue
-            if len(candidate) > 1:
+            # Avoid scores, odds, and very short UI labels.
+            if len(candidate) > 1 and not re.fullmatch(r"[\d\s:.,+-]+", candidate):
                 teams.append(candidate)
             j += 1
+
         if len(teams) == 2:
             key = (kickoff, teams[0], teams[1])
             if key not in seen:
-                fixtures.append({"time": kickoff, "home": teams[0], "away": teams[1], "url": "", "analysis": ""})
+                fixtures.append({
+                    "time": kickoff, "home": teams[0], "away": teams[1],
+                    "url": "", "analysis": ""
+                })
                 seen.add(key)
-        i += 1
+        i += consumed
+
     return fixtures
+
+
+def extract_fixtures_from_dom(page, requested_date):
+    """Önce Flashscore maç kartlarını DOM üzerinden okumayı dener."""
+    selectors = [
+        "div.event__match",
+        "div[class*='event__match']",
+        "div[class*='eventRow']"
+    ]
+    found = []
+    seen = set()
+
+    for card_selector in selectors:
+        cards = page.locator(card_selector)
+        try:
+            count = min(cards.count(), 500)
+        except Exception:
+            continue
+
+        for index in range(count):
+            card = cards.nth(index)
+            try:
+                home = card.locator(
+                    ".event__participant--home, [class*='participant--home']"
+                ).first.inner_text(timeout=1200).strip()
+                away = card.locator(
+                    ".event__participant--away, [class*='participant--away']"
+                ).first.inner_text(timeout=1200).strip()
+                kickoff = card.locator(
+                    ".event__time, [class*='event__time']"
+                ).first.inner_text(timeout=1200).strip()
+                if not home or not away or not kickoff:
+                    continue
+
+                # Kartlar seçilen fikstür gününde listelendiğinden tarih kartın
+                # üst grup başlığından gelebilir; sayfa URL'si de o güne sabitlenir.
+                key = (kickoff, home, away)
+                if key in seen:
+                    continue
+                href = ""
+                try:
+                    href = card.locator("a[href*='/mac/'], a[href*='/match/']").first.get_attribute("href") or ""
+                except Exception:
+                    pass
+                found.append({
+                    "time": kickoff, "home": home, "away": away,
+                    "url": urljoin(BASE_URL, href) if href else "", "analysis": ""
+                })
+                seen.add(key)
+            except Exception:
+                continue
+
+        if found:
+            return found
+
+    return found
 
 
 def attach_match_urls(page, fixtures):
@@ -175,14 +262,28 @@ def api_fixtures():
         league_path = LEAGUES[league].rstrip("/")
         if not league_path.endswith("/fikstur"):
             league_path += "/fikstur"
-        url = BASE_URL + league_path + "/?d=" + date_obj.strftime("%Y-%m-%d")
+        url = BASE_URL + league_path + "/?d=" + date_obj.strftime("%Y%m%d")
         with sync_playwright() as p:
             browser, context = browser_context(p)
             try:
                 page = context.new_page()
-                page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(2500)
-                fixtures = parse_fixtures_from_text(page.locator("body").inner_text(timeout=15000), date_text)
+                response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(5000)
+
+                fixtures = extract_fixtures_from_dom(page, date_text)
+                if not fixtures:
+                    body_text = page.locator("body").inner_text(timeout=15000)
+                    fixtures = parse_fixtures_from_text(body_text, date_text)
+
+                if not fixtures:
+                    body_text = page.locator("body").inner_text(timeout=10000)
+                    app.logger.warning(
+                        "Flashscore bos fikstur: status=%s final_url=%s title=%s body=%s",
+                        response.status if response else "no-response",
+                        page.url,
+                        page.title(),
+                        normalize_text(body_text)[:1200]
+                    )
                 attach_match_urls(page, fixtures)
             finally:
                 context.close()
