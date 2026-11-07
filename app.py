@@ -104,6 +104,48 @@ def parse_fixtures_from_text(page_text, requested_date):
 
         i += 1
 
+    # Render'da Flashscore bazen fikstürü saatli ayrı satırlar yerine
+    # "07.11 Takım A - Takım B, Takım C - Takım D" biçiminde sunuyor.
+    # Yukarıdaki klasik ayrıştırıcı sonuç bulamazsa bu görünümü de oku.
+    if not fixtures:
+        compact_text = normalize_text(page_text)
+        date_blocks = re.finditer(
+            r"(?<!\d)(\d{1,2})\.(\d{1,2})\s+(.+?)"
+            r"(?=(?:\s+\d{1,2}\.\d{1,2}\s)|$)",
+            compact_text
+        )
+
+        for block in date_blocks:
+            day, month = int(block.group(1)), int(block.group(2))
+            if (day, month) != target_key:
+                continue
+
+            match_list = block.group(3)
+            for item in match_list.split(","):
+                item = normalize_text(item)
+                teams = re.split(r"\s+[–—-]\s+", item, maxsplit=1)
+                if len(teams) != 2:
+                    continue
+
+                home, away = map(normalize_text, teams)
+                # Menü metni veya açıklama parçalarının maç sanılmasını önle.
+                if not home or not away or len(home) > 55 or len(away) > 55:
+                    continue
+                if any(word in home.upper() for word in (
+                    "FUTBOL", "BASKETBOL", "VOLEYBOL", "FİKSTÜR", "PUAN DURUMU"
+                )):
+                    continue
+                key = ("—", home, away)
+                if key not in seen:
+                    fixtures.append({
+                        "time": "—",
+                        "home": home,
+                        "away": away,
+                        "url": "",
+                        "analysis": "",
+                    })
+                    seen.add(key)
+
     return fixtures
 
 
