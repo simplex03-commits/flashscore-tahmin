@@ -247,26 +247,38 @@ def extract_analysis(page):
     return result or "Bu maç sayfasında 'Bahis Analizi' bölümü bulunamadı."
 
 
-# Render'da her API isteğinde Chromium başlatmak ciddi gecikme yaratır.
-# Tek Gunicorn worker/thread ile aynı tarayıcı sürecini istekler arasında kullan.
-_BROWSER_LOCK = threading.RLock()
-_PLAYWRIGHT = None
-_BROWSER = None
+# Playwright senkron API'si thread-bound'dur. Flask istekleri farklı
+# thread'lerde çalışabileceği için her thread kendi Playwright/Chromium
+# örneğini kullanır. Aynı thread sonraki isteklerde tarayıcıyı yeniden kullanır.
+_BROWSER_STATE = threading.local()
 
 
 def browser_context(_p=None):
-    global _PLAYWRIGHT, _BROWSER
+    playwright = getattr(_BROWSER_STATE, "playwright", None)
+    browser = getattr(_BROWSER_STATE, "browser", None)
 
-    if _PLAYWRIGHT is None:
-        _PLAYWRIGHT = sync_playwright().start()
+    if playwright is None or browser is None or not browser.is_connected():
+        # Bozuk/eski oturumu bu thread içinde temizle.
+        try:
+            if browser is not None and browser.is_connected():
+                browser.close()
+        except Exception:
+            pass
+        try:
+            if playwright is not None:
+                playwright.stop()
+        except Exception:
+            pass
 
-    if _BROWSER is None or not _BROWSER.is_connected():
-        _BROWSER = _PLAYWRIGHT.chromium.launch(
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
+        _BROWSER_STATE.playwright = playwright
+        _BROWSER_STATE.browser = browser
 
-    context = _BROWSER.new_context(locale="tr-TR")
+    context = browser.new_context(locale="tr-TR")
     # Görsel/video/font indirmeleri maç metni ve analiz için gerekli değil.
     context.route(
         "**/*",
@@ -274,26 +286,7 @@ def browser_context(_p=None):
         if route.request.resource_type in ("image", "media", "font")
         else route.continue_()
     )
-    return _BROWSER, context
-
-
-def close_browser():
-    global _PLAYWRIGHT, _BROWSER
-    try:
-        if _BROWSER is not None and _BROWSER.is_connected():
-            _BROWSER.close()
-    except Exception:
-        pass
-    try:
-        if _PLAYWRIGHT is not None:
-            _PLAYWRIGHT.stop()
-    except Exception:
-        pass
-    _BROWSER = None
-    _PLAYWRIGHT = None
-
-
-atexit.register(close_browser)
+    return browser, context
 
 
 @app.get("/")
@@ -314,25 +307,24 @@ def api_fixtures():
             league_path += "/fikstur"
         league_path += "/"
         url = BASE_URL + league_path + "?d=" + date_obj.strftime("%Y-%m-%d")
-        with _BROWSER_LOCK:
-            browser, context = browser_context()
-            try:
-                page = context.new_page()
-                response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(900)
-                page_text = page.locator("body").inner_text(timeout=15000)
-                fixtures = parse_fixtures_from_text(page_text, date_text)
-                attach_match_urls(page, fixtures)
-                app.logger.info(
-                    "Masaustu akisi: status=%s url=%s fixtures=%s body_chars=%s",
-                    response.status if response else "no-response",
-                    page.url, len(fixtures), len(page_text)
-                )
-                if not fixtures:
-                    app.logger.warning("Flashscore sayfa metni (ilk 1800 karakter): %s",
-                                        normalize_text(page_text)[:1800])
-            finally:
-                context.close()
+        browser, context = browser_context()
+        try:
+            page = context.new_page()
+            response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(900)
+            page_text = page.locator("body").inner_text(timeout=15000)
+            fixtures = parse_fixtures_from_text(page_text, date_text)
+            attach_match_urls(page, fixtures)
+            app.logger.info(
+                "Masaustu akisi: status=%s url=%s fixtures=%s body_chars=%s",
+                response.status if response else "no-response",
+                page.url, len(fixtures), len(page_text)
+            )
+            if not fixtures:
+                app.logger.warning("Flashscore sayfa metni (ilk 1800 karakter): %s",
+                                    normalize_text(page_text)[:1800])
+        finally:
+            context.close()
         return jsonify(fixtures=fixtures, count=len(fixtures))
     except Exception as exc:
         app.logger.exception("Fikstur alinamadi")
@@ -346,23 +338,22 @@ def api_analysis():
     if not match_url.startswith(BASE_URL + "/"):
         return jsonify(error="Geçersiz maç bağlantısı."), 400
     try:
-        with _BROWSER_LOCK:
-            browser, context = browser_context()
+        browser, context = browser_context()
+        try:
+            page = context.new_page()
+            page.goto(match_url, wait_until="domcontentloaded", timeout=60000)
             try:
-                page = context.new_page()
-                page.goto(match_url, wait_until="domcontentloaded", timeout=60000)
-                try:
-                    page.wait_for_function(
-                        "() => (document.body?.innerText || '').toLocaleLowerCase('tr-TR').includes('bahis analizi')",
-                        timeout=5000
-                    )
-                except Exception:
-                    # Bazı maçlarda analiz bölümü hiç olmayabilir; mevcut çıkarıcı
-                    # yine de sayfayı kontrol edip açıklayıcı sonuç döndürür.
-                    pass
-                analysis = extract_analysis(page)
-            finally:
-                context.close()
+                page.wait_for_function(
+                    "() => (document.body?.innerText || '').toLocaleLowerCase('tr-TR').includes('bahis analizi')",
+                    timeout=5000
+                )
+            except Exception:
+                # Bazı maçlarda analiz bölümü hiç olmayabilir; mevcut çıkarıcı
+                # yine de sayfayı kontrol edip açıklayıcı sonuç döndürür.
+                pass
+            analysis = extract_analysis(page)
+        finally:
+            context.close()
         return jsonify(analysis=analysis)
     except Exception as exc:
         app.logger.exception("Analiz alinamadi")
