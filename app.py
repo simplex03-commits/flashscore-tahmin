@@ -1,11 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Flashscore fikstur ve bahis analizi - web surumu."""
+"""Flashscore fikstur ve bahis analizi - Render icin duzeltilmis web surumu."""
 import os
 import re
-import threading
-import atexit
 from datetime import datetime
-from urllib.parse import urljoin
 
 from flask import Flask, jsonify, render_template, request
 
@@ -247,46 +244,58 @@ def extract_analysis(page):
     return result or "Bu maç sayfasında 'Bahis Analizi' bölümü bulunamadı."
 
 
-# Playwright senkron API'si thread-bound'dur. Flask istekleri farklı
-# thread'lerde çalışabileceği için her thread kendi Playwright/Chromium
-# örneğini kullanır. Aynı thread sonraki isteklerde tarayıcıyı yeniden kullanır.
-_BROWSER_STATE = threading.local()
+def open_browser_context():
+    """Her HTTP isteğinde aynı thread içinde yeni Playwright oturumu aç.
 
-
-def browser_context(_p=None):
-    playwright = getattr(_BROWSER_STATE, "playwright", None)
-    browser = getattr(_BROWSER_STATE, "browser", None)
-
-    if playwright is None or browser is None or not browser.is_connected():
-        # Bozuk/eski oturumu bu thread içinde temizle.
-        try:
-            if browser is not None and browser.is_connected():
-                browser.close()
-        except Exception:
-            pass
-        try:
-            if playwright is not None:
-                playwright.stop()
-        except Exception:
-            pass
-
-        playwright = sync_playwright().start()
+    Playwright sync nesneleri thread-bound olduğu için Gunicorn thread'leri
+    arasında tarayıcı paylaşılmaz. İstek bitince context, browser ve Playwright
+    kesin olarak kapatılır; eski thread-local oturumların birikmesi önlenir.
+    """
+    playwright = sync_playwright().start()
+    browser = None
+    context = None
+    try:
         browser = playwright.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
-        _BROWSER_STATE.playwright = playwright
-        _BROWSER_STATE.browser = browser
+        context = browser.new_context(locale="tr-TR")
+        context.set_default_timeout(15000)
+        context.set_default_navigation_timeout(45000)
+        context.route(
+            "**/*",
+            lambda route: route.abort()
+            if route.request.resource_type in ("image", "media", "font")
+            else route.continue_()
+        )
+        return playwright, browser, context
+    except Exception:
+        if context:
+            try:
+                context.close()
+            except Exception:
+                pass
+        if browser:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        playwright.stop()
+        raise
 
-    context = browser.new_context(locale="tr-TR")
-    # Görsel/video/font indirmeleri maç metni ve analiz için gerekli değil.
-    context.route(
-        "**/*",
-        lambda route: route.abort()
-        if route.request.resource_type in ("image", "media", "font")
-        else route.continue_()
-    )
-    return browser, context
+
+def close_browser_context(playwright, browser, context):
+    for resource in (context, browser):
+        if resource is not None:
+            try:
+                resource.close()
+            except Exception:
+                pass
+    if playwright is not None:
+        try:
+            playwright.stop()
+        except Exception:
+            pass
 
 
 @app.get("/")
@@ -307,7 +316,7 @@ def api_fixtures():
             league_path += "/fikstur"
         league_path += "/"
         url = BASE_URL + league_path + "?d=" + date_obj.strftime("%Y-%m-%d")
-        browser, context = browser_context()
+        playwright, browser, context = open_browser_context()
         try:
             page = context.new_page()
             response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -324,7 +333,7 @@ def api_fixtures():
                 app.logger.warning("Flashscore sayfa metni (ilk 1800 karakter): %s",
                                     normalize_text(page_text)[:1800])
         finally:
-            context.close()
+            close_browser_context(playwright, browser, context)
         return jsonify(fixtures=fixtures, count=len(fixtures))
     except Exception as exc:
         app.logger.exception("Fikstur alinamadi")
@@ -335,13 +344,15 @@ def api_fixtures():
 def api_analysis():
     data = request.get_json(silent=True) or {}
     match_url = data.get("url", "")
-    if not match_url.startswith(BASE_URL + "/"):
+    if not isinstance(match_url, str) or not match_url.startswith(BASE_URL + "/"):
         return jsonify(error="Geçersiz maç bağlantısı."), 400
     try:
-        browser, context = browser_context()
+        playwright, browser, context = open_browser_context()
         try:
             page = context.new_page()
-            page.goto(match_url, wait_until="domcontentloaded", timeout=60000)
+            response = page.goto(match_url, wait_until="domcontentloaded", timeout=45000)
+            if response is not None and response.status >= 400:
+                raise RuntimeError(f"Flashscore maç sayfası HTTP {response.status} yanıtı verdi.")
             try:
                 page.wait_for_function(
                     "() => (document.body?.innerText || '').toLocaleLowerCase('tr-TR').includes('bahis analizi')",
@@ -353,11 +364,33 @@ def api_analysis():
                 pass
             analysis = extract_analysis(page)
         finally:
-            context.close()
+            close_browser_context(playwright, browser, context)
         return jsonify(analysis=analysis)
     except Exception as exc:
         app.logger.exception("Analiz alinamadi")
         return jsonify(error=f"Analiz alınamadı: {str(exc)[:300]}"), 500
+
+
+@app.errorhandler(404)
+def handle_not_found(error):
+    if request.path.startswith("/api/"):
+        return jsonify(error="API adresi bulunamadı: " + request.path), 404
+    return error
+
+
+@app.errorhandler(405)
+def handle_method_not_allowed(error):
+    if request.path.startswith("/api/"):
+        return jsonify(error="Bu API adresi için HTTP yöntemi desteklenmiyor."), 405
+    return error
+
+
+@app.errorhandler(500)
+def handle_internal_error(error):
+    if request.path.startswith("/api/"):
+        app.logger.exception("API içinde beklenmeyen sunucu hatası")
+        return jsonify(error="Sunucuda beklenmeyen bir hata oluştu."), 500
+    return error
 
 
 @app.get("/health")
