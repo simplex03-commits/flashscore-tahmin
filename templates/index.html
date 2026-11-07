@@ -35,14 +35,24 @@ input,select,button{font:inherit;border-radius:9px;min-height:44px}input,select{
 const $=id=>document.getElementById(id);let allMatches=[],selected=-1,busy=false;
 const today=new Date();$('date').value=[today.getFullYear(),String(today.getMonth()+1).padStart(2,'0'),String(today.getDate()).padStart(2,'0')].join('-');
 function loading(on,msg){busy=on;$('progress').style.display=on?'block':'none';$('fetch').disabled=on;if(msg)$('status').textContent=msg;}
+async function readApiResponse(response){
+ const raw=await response.text();
+ let data;
+ try{data=JSON.parse(raw);}catch(_){
+   const kind=(raw||'').trim().slice(0,40).toLowerCase().startsWith('<!doctype')|| (raw||'').trim().startsWith('<')?'HTML hata sayfası':'geçersiz yanıt';
+   throw new Error(`Sunucu JSON yerine ${kind} döndürdü (HTTP ${response.status}). Render sunucu kayıtlarını kontrol etmek gerekiyor.`);
+ }
+ if(!response.ok)throw new Error(data.error||`Sunucu hatası (HTTP ${response.status}).`);
+ return data;
+}
 function renderMatches(){const q=$('search').value.trim().toLocaleLowerCase('tr-TR');const box=$('matches');box.innerHTML='';let shown=0;
  allMatches.forEach((m,i)=>{const label=`${m.time} ${m.home} ${m.away}`;if(q&&!label.toLocaleLowerCase('tr-TR').includes(q))return;shown++;const b=document.createElement('button');b.className='match'+(selected===i?' active':'');b.innerHTML=`<span class="time"></span>`;b.querySelector('.time').textContent=m.time;b.append(document.createTextNode(` ${m.home} - ${m.away}`));b.onclick=()=>chooseMatch(i);box.append(b);});
  $('count').textContent=q?`${shown} / ${allMatches.length} maç`:`${allMatches.length} maç`;if(!shown)box.textContent='Eşleşen maç bulunamadı.';
 }
 async function fetchFixtures(){if(busy)return;loading(true,'Flashscore fikstürleri yükleniyor...');$('analysis').textContent='Seçilen tarihin maçları getiriliyor...';$('matches').textContent='Maçlar yükleniyor...';allMatches=[];selected=-1;$('count').textContent='0 maç';
- try{const r=await fetch('/api/fixtures',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({date:$('date').value,league:$('league').value})});const d=await r.json();if(!r.ok)throw Error(d.error||'Fikstür alınamadı.');allMatches=d.fixtures||[];renderMatches();$('analysis').textContent=allMatches.length?'Listeden bir maç seçin. Sağ tarafta Bahis Analizi gösterilecek.':'Seçilen tarih için maç bulunamadı.';$('status').textContent=`${allMatches.length} maç bulundu.`;
+ try{const r=await fetch('/api/fixtures',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({date:$('date').value,league:$('league').value})});const d=await readApiResponse(r);allMatches=d.fixtures||[];renderMatches();$('analysis').textContent=allMatches.length?'Listeden bir maç seçin. Sağ tarafta Bahis Analizi gösterilecek.':'Seçilen tarih için maç bulunamadı.';$('status').textContent=`${allMatches.length} maç bulundu.`;
  }catch(e){$('matches').textContent='Maçlar alınamadı.';$('analysis').textContent=e.message;$('status').textContent='Hata oluştu.';}finally{loading(false);}}
-async function chooseMatch(i){if(busy)return;selected=i;renderMatches();const m=allMatches[i];if(!m.url){$('analysis').textContent='Bu maçın Flashscore bağlantısı bulunamadı.';$('status').textContent='Maç bağlantısı bulunamadı.';return;}
- loading(true,`Analiz yükleniyor: ${m.home} - ${m.away}`);$('analysis').textContent='Bahis Analizi yükleniyor...';try{const r=await fetch('/api/analysis',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:m.url})});const d=await r.json();if(!r.ok)throw Error(d.error||'Analiz alınamadı.');m.analysis=d.analysis;$('analysis').textContent=d.analysis;$('status').textContent='Analiz hazır.';}catch(e){$('analysis').textContent=e.message;$('status').textContent='Analiz alınamadı.';}finally{loading(false);}}
+async function chooseMatch(i){if(busy)return;selected=i;renderMatches();const m=allMatches[i];if(!m.url){$('analysis').textContent='Bu maçın Flashscore bağlantısı bulunamadı. Fikstür bağlantısı alınamadığı için analiz isteği gönderilemedi.';$('status').textContent='Maç bağlantısı bulunamadı.';return;}
+ loading(true,`Analiz yükleniyor: ${m.home} - ${m.away}`);$('analysis').textContent='Bahis Analizi yükleniyor...';try{const r=await fetch('/api/analysis',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:m.url})});const d=await readApiResponse(r);m.analysis=d.analysis;$('analysis').textContent=d.analysis;$('status').textContent='Analiz hazır.';}catch(e){$('analysis').textContent=e.message;$('status').textContent='Analiz alınamadı.';}finally{loading(false);}}
 $('fetch').addEventListener('click',fetchFixtures);$('search').addEventListener('input',renderMatches);
 </script></body></html>
